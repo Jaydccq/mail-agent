@@ -1,0 +1,29 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.14"]  # 最低支持版本 + 最新版本
+    services:
+      greenmail:  # 和 tests/test_mail_greenmail.py 顶部的 docker 命令一致
+        image: greenmail/standalone:2.1.3
+        env:
+          GREENMAIL_OPTS: >-
+            -Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0
+            -Dgreenmail.users=me:apppass@localhost -Dgreenmail.users.login=email
+        ports: ["3025:3025", "3143:3143", "3465:3465", "3993:3993"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: ruff check
+      - run: mypy
+      - name: Wait for GreenMail  # 没起来的话集成测试会被整文件跳过，CI 却是绿的
+        run: for i in $(seq 60); do nc -z 127.0.0.1 3993 && exit 0; sleep 1; done; exit 1
+      - run: pytest -rs  # 端到端测试需要 Jev key，这里会跳过（-rs 列出跳过原因）
