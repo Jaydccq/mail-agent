@@ -1,0 +1,127 @@
+{
+ "provider": "claude-cli",
+ "decisions": {
+  "boss": "notify (importance=2.81, triage by jev)",
+  "invoice": "notify (needs_action=0.98, triage by jev)",
+  "offsite": "notify (importance=2.23, triage by jev)",
+  "parcel": "digest (importance=1.12, triage by jev)",
+  "bank": "notify (importance=2.81, triage by jev)",
+  "news": "skip (importance=0.25, triage by jev)",
+  "promo": "skip (importance=0.06, triage by jev)"
+ },
+ "screens": {
+  "notification": [
+   {
+    "who": "bot",
+    "time": "13:50",
+    "msg": {
+     "title": "📬 Li Wei",
+     "text": "Subject: Q4 budget sheet needed by Friday\n\nLi Wei says Finance needs the Q4 department budget sheet by end of day this Friday. Li Wei is asking Jamie to add the numbers for Jamie's two projects and send the sheet back. Any questions can be covered at Thursday's 1:1.\n\n👉 You need to: Add the Q4 budget numbers for your two projects to the department budget sheet and send it back to Li Wei by end of day Friday (Nov 6).\n\n🗓 Fri, Nov 6 Send the completed Q4 department budget sheet with numbers for your two projects to Li Wei by end of day.\n🗓 Thu, Nov 5 1:1 with Li Wei, where you can go over any questions about the budget sheet.\n\nwork · Mon, Nov 2 13:20",
+     "markdown": false,
+     "buttons": [
+      [
+       "✅ Done",
+       "🔕 Mute this sender"
+      ],
+      [
+       "✍️ Draft a reply"
+      ]
+     ]
+    }
+   }
+  ],
+  "chat": [
+   {
+    "who": "user",
+    "time": "13:50",
+    "text": "How much is the Acme Cloud invoice, and when is it due?"
+   },
+   {
+    "who": "bot",
+    "time": "13:50",
+    "msg": {
+     "title": null,
+     "text": "The Acme Cloud invoice **INV-2291** (October) is:\n- Amount: **$1,240.50**\n- Due: **Nov 30, 2026** (Mon)\n- Pay online: https://pay.acmecloud.example/INV-2291\n\nDo you want a reminder before it's due?",
+     "markdown": true,
+     "buttons": []
+    }
+   },
+   {
+    "who": "user",
+    "time": "13:50",
+    "text": "Remind me to pay it two days before it's due."
+   },
+   {
+    "who": "bot",
+    "time": "13:50",
+    "msg": {
+     "title": null,
+     "text": "I added a todo to pay the Acme Cloud invoice **two days early**:\n- Pay by: **Sat, Nov 28** (the invoice is due Nov 30)\n- Amount: **$1,240.50** (INV-2291)\n- Link: https://pay.acmecloud.example/INV-2291\n\nI'll remind you on **Fri, Nov 27 at 20:00** and again on Sat, Nov 28 at 09:00.",
+     "markdown": true,
+     "buttons": []
+    }
+   }
+  ],
+  "draft": [
+   {
+    "who": "user",
+    "time": "13:50",
+    "text": "Reply to Li Wei: I'll send the sheet by Thursday noon."
+   },
+   {
+    "who": "bot",
+    "time": "13:50",
+    "msg": {
+     "title": null,
+     "text": "I wrote a draft reply to **Li Wei** about \"Q4 budget sheet needed by Friday\":\n- It says you'll send the sheet back **by Thursday noon**, ahead of Friday's deadline\n- Signed **Jamie**\n\nI saved it to Gmail Drafts and sent you a preview. Check it, then tap **Send** if it looks right.\n\nDo you want a todo for Thursday noon too?",
+     "markdown": true,
+     "buttons": []
+    }
+   },
+   {
+    "who": "bot",
+    "time": "13:50",
+    "msg": {
+     "title": "✉️ Reply draft (not sent)",
+     "text": "From: jamie@northwind.example\nTo: li.wei@northwind.example\nSubject: Re: Q4 budget sheet needed by Friday\n\n———— Message ————\nHi Li Wei,\n\nThanks for the heads-up. I'll fill in the numbers for my two projects and send the sheet back to you by Thursday noon, ahead of Friday's deadline. If anything comes up, I'll flag it before our 1:1.\n\nBest,\nJamie\n————————————\n\nSaved to Gmail Drafts too, so you can also edit it there and send it yourself.\n\nCode 9FHB. You can also reply: confirm 1 9FHB",
+     "markdown": false,
+     "buttons": [
+      [
+       "📤 Send",
+       "Cancel"
+      ]
+     ]
+    }
+   }
+  ],
+  "digest": [
+   {
+    "who": "bot",
+    "time": "18:00",
+    "msg": {
+     "title": "📋 Digest · 18:00",
+     "text": "📬 Email digest for Mon, Nov 2\n\nWorth a look\n• ParcelFast — Your order has shipped: Order #4471 shipped today and should arrive Thu, Nov 5; the email has a tracking link.\n\nComing up\n• Wed 11/04 — Vote in the offsite poll: choose Nov 19 or Nov 20.\n• Thu 11/05 — 1:1 with Li Wei: a chance to go over questions about the budget sheet.\n• Thu 11/05 — Order #4471 is due to arrive.",
+     "markdown": true,
+     "buttons": []
+    }
+   }
+  ],
+  "reminder": [
+   {
+    "who": "bot",
+    "time": "20:00",
+    "msg": {
+     "title": "⏰ Send the completed Q4 department budget sheet with numbers for your two projects to Li Wei by end of day.",
+     "text": "Due: Fri, Nov 6\nFrom email: Q4 budget sheet needed by Friday",
+     "markdown": false,
+     "buttons": [
+      [
+       "✅ Done",
+       "💤 Tomorrow"
+      ]
+     ]
+    }
+   }
+  ]
+ }
+}
