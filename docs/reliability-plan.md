@@ -15,3 +15,5 @@ Assumptions: existing accounts and preferences remain authoritative. Use standar
 Uncertainties: historical template analyses may contain no actionable dates; recovery must never invent a task. Message grouping affects alert cadence, so only ordinary follow-ups are delayed, with bounded group size. External services and laptop sleep remain outside continuous availability guarantees.
 
 Slices: health heartbeat and doctor; private backups and restore verification; persistent analysis recovery; thread grouping; overdue review and digest ordering; full regression and deployment. Each slice includes focused regression tests, then the final suite, lint, type checks, package verification, and real read-only dependency probes.
+
+Status: completed and deployed as 0.2.0. All five success criteria passed their regression checks; 172 tests passed with no skips. Historical recovery completed for all eight eligible template analyses without replaying their notifications. See [the deployment acceptance record](reliability-validation-2026-11-06.md).

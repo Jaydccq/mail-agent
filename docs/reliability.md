@@ -55,6 +55,8 @@ Schema version 2 creates dedicated recovery and notification-membership tables a
 
 ## Verification
 
+The installed 0.2.0 release passed [deployment acceptance on 2026-11-06](reliability-validation-2026-11-06.md), including all 172 tests and recovery of the eight historical template analyses.
+
 Regression coverage in `tests/test_reliability.py` includes empty-INBOX heartbeats, daemon health exit codes, WAL snapshots and isolated restores, retention and file permissions, backup failure/restart scheduling, analysis recovery after restart, bounded retries, atomic deadlines, grouped delivery membership and claims, quiet-hour boundaries, group limits, grouped-card edits, explicit overdue decisions, digest ordering and safe CLI diagnostics.
 
 The full integration environment can run without Docker when Java 17 is available. Download `greenmail-standalone-2.1.3.jar` from Maven Central into a temporary directory, then run:
