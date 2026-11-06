@@ -100,8 +100,13 @@ def _out_from_payload(payload: str) -> OutMessage:
 
 async def outbox_worker(db: Database, channels: dict[str, Channel]) -> None:
     """每 2 秒发送 outbox 里到时间的消息；可重试的失败指数退避（封顶 1 小时，一直重试直到送达）。"""
+    db.reset_outbox_claims()
     while True:
         for row in db.ready_outbox(utcnow()):
+            claimed = db.claim_outbox(row["id"])
+            if claimed is None:
+                continue
+            row = claimed
             ch = channels.get(row["channel"])
             if ch is None:
                 db.outbox_failed(row["id"], f"channel {row['channel']} is not enabled", retry_at=None)
@@ -109,6 +114,7 @@ async def outbox_worker(db: Database, channels: dict[str, Channel]) -> None:
             try:
                 provider_id = await ch.send(row["chat_id"], _out_from_payload(row["payload"]))
             except asyncio.CancelledError:
+                db.outbox_failed(row["id"], "Delivery interrupted", retry_at=utcnow() + timedelta(seconds=30))
                 raise
             except ChannelError as e:
                 if e.retryable:
@@ -347,6 +353,7 @@ class App:
             w.start()
         jobs: list[tuple[str, Callable[[], Awaitable[Any]]]] = [
             ("pipeline", self.pipeline.run),
+            ("analysis-recovery", self.pipeline.recovery_worker),
             ("outbox", lambda: outbox_worker(self.db, self.channels)),
             ("scheduler", self.scheduler.run),
         ]

@@ -807,7 +807,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             db.close()
         print("\nMailboxes:")
         for m in s.pop("mailboxes"):
-            line = f"  {m['mailbox_id']}: {m['status']}, last sync {m.get('last_sync_at') or '-'}"
+            line = (f"  {m['mailbox_id']}: {m['status']}, last inbox check {m.get('last_sync_at') or '-'}, "
+                    f"last mail received {m.get('last_message_at') or '-'}")
             if m.get("error") and m["status"] != "ok":
                 line += f", error: {str(m['error'])[:200]}"
             print(line)
@@ -885,9 +886,46 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         except Exception as e:  # noqa: BLE001
             report(False, f"Generative model {cfg.llm.provider}", _err(e))
 
-    print(f"ℹ️ Background service: {service_status()}")
+    service = service_status()
+    report(service == "running", "Background service", service)
     print("\nAll good ✅" if not failures else f"\n{failures} problem(s) found")
     return 0 if not failures else 1
+
+
+def cmd_retry_analysis(args: argparse.Namespace) -> int:
+    from mailagent.agent.timeutil import utcnow
+    from mailagent.db import Database
+
+    cfg = _load()
+    if cfg is None:
+        return 2
+    if not _db_path().exists():
+        print("No database yet.")
+        return 1
+    db = Database(_db_path())
+    try:
+        count = db.retry_failed_analyses([m.id for m in cfg.mailboxes], utcnow())
+    finally:
+        db.close()
+    print(f"Queued {count} failed analyses for another bounded recovery cycle. Old notifications are not replayed.")
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    import sqlite3
+
+    from mailagent.backup import create_backup, verify_backup
+
+    try:
+        if args.verify:
+            counts = verify_backup(Path(args.verify))
+            print("✅ Isolated restore and integrity checks passed: " + json.dumps(counts))
+        else:
+            print(f"✅ Verified backup: {create_backup(_db_path())}")
+    except (OSError, ValueError, sqlite3.Error) as e:
+        print(f"❌ Backup failed: {type(e).__name__}")
+        return 1
+    return 0
 
 
 def cmd_test_notify(args: argparse.Namespace) -> int:
@@ -1088,6 +1126,9 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("-v", "--verbose", action="store_true", help="print debug logs")
     sub.add_parser("status", help="show config (secrets hidden) and runtime status")
     sub.add_parser("doctor", help="check config and every connection")
+    sub.add_parser("retry-analysis", help="retry exhausted analysis jobs from the last seven days")
+    p_backup = sub.add_parser("backup", help="create a private, verified database snapshot (retains seven)")
+    p_backup.add_argument("--verify", metavar="PATH", help="verify an existing backup by an isolated restore")
     p_add = sub.add_parser("add-mailbox", help="add a Gmail mailbox (or update its app password)")
     p_add.add_argument("address", nargs="?", metavar="ADDRESS", help="Gmail or Google Workspace address")
     p_rm = sub.add_parser("remove-mailbox", help="stop watching a mailbox")
@@ -1113,6 +1154,8 @@ def main(argv: list[str] | None = None) -> int:
         "run": cmd_run,
         "status": cmd_status,
         "doctor": cmd_doctor,
+        "backup": cmd_backup,
+        "retry-analysis": cmd_retry_analysis,
         "add-mailbox": cmd_add_mailbox,
         "remove-mailbox": cmd_remove_mailbox,
         "mailboxes": cmd_mailboxes,

@@ -153,6 +153,7 @@ class MailWatcher:
                 break
             # 不管有没有收到 EXISTS 都补一次，防止漏推送
             self._catch_up(box, uidvalidity)
+            self._status("ok", None)  # 无新邮件也更新成功检查时间，不能把空收件箱误判为停摆
 
     def _catch_up(self, box: ImapMailbox, uidvalidity: int) -> None:
         while not self._stop.is_set():

@@ -23,7 +23,7 @@ from mailagent.agent.scheduler import Scheduler, with_imap
 from mailagent.agent.suggest import Candidate
 from mailagent.agent.timeutil import (
     WEEKDAYS, find_timezone, fmt_local, next_reminder, parse_date, parse_hhmm, parse_local_datetime, parse_iso_safe, to_local,
-    tomorrow_at, utcnow,
+    tomorrow_at, today_local, utcnow,
 )
 from mailagent.ai import analyze
 from mailagent.ai.llm.base import LLM, LLMError
@@ -60,6 +60,7 @@ CHAT_SCHEMA: dict[str, Any] = {
 
 HELP_TEXT = """Commands:
 /todo — open todos
+/overdue [page] — review overdue tasks; only your Done/Dismiss tap closes them
 /digest — send a digest now
 /status — how things are running
 /mailboxes — your mailboxes and their sync status
@@ -299,6 +300,14 @@ class ChatAgent:
             result = await self._tool_draft_reply(ib, {"message": str(obj_id), "instructions": ""})
             if "error" in result:
                 await self._send(ib, OutMessage(text=f"❌ Couldn't draft a reply: {result['error']}"))
+        elif verb in ("reviewdone", "reviewdismiss"):
+            todo = self.db.get_todo(obj_id)
+            today = today_local(utcnow(), self.tz).isoformat()
+            if todo and todo.get("due_date") and todo["due_date"] < today:
+                self.db.close_todo(obj_id, "done" if verb == "reviewdone" else "dismissed", "user_review")
+            await self._ack(ib, "Updated")
+            page = max(1, int(arg2)) if arg2.isdigit() else 1
+            await self._edit_or_send(ib, ib.message_id, self._overdue_message(page))
         elif verb == "done":
             todo = self.db.get_todo(obj_id)
             ok = self.db.close_todo(obj_id, "done", "user")
@@ -386,6 +395,12 @@ class ChatAgent:
     async def _edit_mail_card(self, ib: Inbound, msg_id: int, line: str) -> None:
         row = self.db.get_message(msg_id)
         if not row or not ib.message_id:
+            return
+        grouped = self.db.grouped_notification(msg_id)
+        if grouped:
+            payload = json.loads(grouped['payload'])
+            card = OutMessage(title=payload.get('title'), text=payload['text'])
+            await self._edit_or_send(ib, ib.message_id, render.with_result(card, f"Mail #{msg_id}: {line}"))
             return
         mail = self.db.message_from_row(row)
         # 渲染时的 deadlines 没有存在 messages 上，用该邮件仍未完成的待办近似
@@ -476,6 +491,11 @@ class ChatAgent:
             await self._send(ib, self._status_message())
         elif cmd in ("/todo", "/todos"):
             await self._send(ib, render.todo_list(db.open_todos()))
+        elif cmd == "/overdue":
+            if args and (len(args) > 1 or not args[0].isdigit() or len(args[0]) > 6 or int(args[0]) < 1):
+                await self._send(ib, OutMessage(text="Use /overdue or /overdue <page>, starting at page 1."))
+            else:
+                await self._send(ib, self._overdue_message(int(args[0]) if args else 1))
         elif cmd == "/digest":
             await self._typing(ib)
             await self._send(ib, await self.scheduler.manual_digest())
@@ -536,11 +556,19 @@ class ChatAgent:
             line = f"{icon} {mb.address} (id: {mb.id}) — {label}"
             last = parse_iso_safe(st.get("last_sync_at"))
             if last:
-                line += f", last synced {fmt_local(last, self.tz)}"
+                line += f", last inbox check {fmt_local(last, self.tz)}"
             if status in ("error", "auth_failed") and st.get("error"):
                 line += f"\n    {str(st['error'])[:200]}"
             lines.append(line)
         return lines
+
+    def _overdue_message(self, page: int) -> OutMessage:
+        today = today_local(utcnow(), self.tz).isoformat()
+        rows, total = self.db.overdue_todos(today, offset=(page - 1) * 5)
+        if not rows and total:
+            page = max(1, (total + 4) // 5)
+            rows, total = self.db.overdue_todos(today, offset=(page - 1) * 5)
+        return render.overdue_list(rows, total, page)
 
     def _status_message(self) -> OutMessage:
         s = self.db.stats()
@@ -554,6 +582,8 @@ class ChatAgent:
             f"Alerts in the last 24 h {s['notified_24h']}, open todos {s['open_todos']}",
             f"Notifications queued {s['outbox_queued']}, failed to send {s['outbox_failed']}",
             f"AI model: {self.llm.name if self.llm else 'not configured'}",
+            f"Analysis recovery: {s['analysis_recovery_queued']} queued, {s['analysis_recovery_failed']} need attention",
+            f"Last verified backup: {s['backup_last_success']} (error: {s['backup_error']})",
         ]
         return OutMessage(title="📊 Status", text="\n".join(lines))
 

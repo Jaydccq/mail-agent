@@ -85,6 +85,18 @@ def todo_list(todos: list[dict[str, Any]], max_buttons: int = 5) -> OutMessage:
     return OutMessage(text="\n".join(lines), title=f"📝 Todos ({len(todos)})", buttons=buttons)
 
 
+def overdue_list(todos: list[dict[str, Any]], total: int, page: int) -> OutMessage:
+    if not total:
+        return OutMessage(title="🗂 Overdue review", text="No overdue tasks. Nothing was changed.")
+    lines = [f"{total} overdue task(s). They stay open until you choose Done or Dismiss.", ""]
+    lines += [f"#{t['id']} {t['title']} ({todo_due_text(t)})" for t in todos]
+    pages = (total + 4) // 5
+    lines += ["", f"Page {page}/{pages}. Open another page with /overdue <page>."]
+    buttons = [[Button(f"✅ Done #{t['id']}", f"reviewdone:{t['id']}:{page}"),
+                Button(f"Dismiss #{t['id']}", f"reviewdismiss:{t['id']}:{page}")] for t in todos]
+    return OutMessage(title="🗂 Overdue review", text="\n".join(lines), buttons=buttons)
+
+
 def action_preview(action: dict[str, Any], note: str = "") -> OutMessage:
     """发信预览：完整展示，按钮带确认码。"""
     p = json.loads(action["payload"]) if isinstance(action["payload"], str) else action["payload"]

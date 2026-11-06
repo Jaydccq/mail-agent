@@ -19,7 +19,7 @@ from typing import Any
 
 from mailagent.models import Analysis, MailMessage, OutMessage, Triage
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # 运行记录保留多久（db.prune）；邮件、待办、规则、记忆、草稿动作都不清理
 KEEP_RECORDS = timedelta(days=30)  # 已发出/已放弃的通知、渠道事件去重、确认卡片
 KEEP_CHAT = timedelta(days=90)  # 聊天记录（只有最近几轮会进提示词）
@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_status ON messages(status, id);
 CREATE INDEX IF NOT EXISTS messages_digest ON messages(decision, digested_at);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(mailbox_id, gm_thrid);
+CREATE INDEX IF NOT EXISTS messages_arrival ON messages(mailbox_id, created_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject, from_addr, from_name, body_text,
@@ -129,7 +130,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     channel TEXT NOT NULL,
     chat_id TEXT NOT NULL,
     payload TEXT NOT NULL,                    -- OutMessage JSON
-    status TEXT NOT NULL DEFAULT 'queued',    -- queued | sent | failed
+    status TEXT NOT NULL DEFAULT 'queued',    -- queued | sending | sent | failed
     not_before TEXT NOT NULL,                 -- UTC；静默时段推迟到这之后
     attempts INTEGER NOT NULL DEFAULT 0,
     provider_message_id TEXT,
@@ -217,6 +218,20 @@ CREATE TABLE IF NOT EXISTS digests (
     sent_at TEXT NOT NULL,
     item_count INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS analysis_recovery (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    retry_at TEXT,
+    last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notification_items (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    outbox_id INTEGER NOT NULL REFERENCES outbox(id) ON DELETE CASCADE,
+    groupable INTEGER NOT NULL CHECK (groupable IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS notification_items_outbox ON notification_items(outbox_id);
 """
 
 
@@ -411,6 +426,63 @@ class Database:
         with self._tx() as c:
             c.execute("UPDATE messages SET notified_at = ? WHERE id = ?", (iso(utcnow()), msg_id))
 
+    def seed_analysis_recovery(self, mailbox_ids: list[str], now: datetime) -> None:
+        placeholders = ",".join("?" for _ in mailbox_ids)
+        with self._tx() as c:
+            if not mailbox_ids:
+                c.execute("DELETE FROM analysis_recovery")
+                return
+            c.execute(f"""DELETE FROM analysis_recovery WHERE message_id IN (SELECT id FROM messages
+                WHERE handled = 1 OR analysis_source != 'template' OR mailbox_id NOT IN ({placeholders}))""",
+                tuple(mailbox_ids))
+            c.execute(f"""INSERT OR IGNORE INTO analysis_recovery(message_id, retry_at)
+                SELECT id, CASE WHEN created_at > ? THEN ? ELSE ? END FROM messages
+                WHERE status = 'done' AND analysis_source = 'template' AND handled = 0
+                AND created_at >= ? AND mailbox_id IN ({placeholders})
+                AND (decision = 'notify' OR has_time >= 0.5 OR needs_action >= 0.5)""",
+                (iso(now - timedelta(minutes=15)), iso(now + timedelta(minutes=15)), iso(now),
+                 iso(now - timedelta(days=7)), *mailbox_ids))
+
+    def due_analysis_recovery(self, now: datetime) -> dict[str, Any] | None:
+        return self._one("""SELECT r.*, m.mailbox_id FROM analysis_recovery r
+            JOIN messages m ON m.id = r.message_id WHERE retry_at <= ?
+            ORDER BY retry_at, message_id LIMIT 1""", (iso(now),))
+
+    def analysis_recovery_failed(self, msg_id: int, error: str, retry_at: datetime | None) -> None:
+        with self._tx() as c:
+            c.execute("""UPDATE analysis_recovery SET attempts = attempts + 1, last_error = ?, retry_at = ?
+                WHERE message_id = ?""", (error, iso(retry_at), msg_id))
+
+    def complete_analysis_recovery(self, msg_id: int, analysis: Analysis | None = None) -> None:
+        with self._tx() as c:
+            if analysis is not None:
+                c.execute("""UPDATE messages SET summary = ?, action = ?, analysis_source = ?
+                    WHERE id = ?""", (analysis.summary, analysis.action, analysis.source, msg_id))
+            c.execute("DELETE FROM analysis_recovery WHERE message_id = ?", (msg_id,))
+
+    def recovery_counts(self) -> tuple[int, int]:
+        row = self._one("""SELECT COUNT(retry_at) AS queued,
+            COUNT(*) - COUNT(retry_at) AS failed FROM analysis_recovery""")
+        assert row is not None
+        return row["queued"], row["failed"]
+
+    def retry_failed_analyses(self, mailbox_ids: list[str], now: datetime) -> int:
+        if not mailbox_ids:
+            return 0
+        placeholders = ','.join('?' for _ in mailbox_ids)
+        with self._tx() as c:
+            cur = c.execute(f"""UPDATE analysis_recovery SET attempts = 0, retry_at = ?, last_error = NULL
+                WHERE retry_at IS NULL AND message_id IN (SELECT id FROM messages
+                    WHERE handled = 0 AND analysis_source = 'template' AND created_at >= ?
+                    AND mailbox_id IN ({placeholders}))""",
+                (iso(now), iso(now - timedelta(days=7)), *mailbox_ids))
+            return cur.rowcount
+
+    def grouped_notification(self, msg_id: int) -> dict[str, Any] | None:
+        return self._one("""SELECT o.payload FROM outbox o JOIN notification_items i ON i.outbox_id = o.id
+            WHERE i.message_id = ? AND (SELECT COUNT(*) FROM notification_items n WHERE n.outbox_id = o.id) > 1""",
+            (msg_id,))
+
     def mark_handled(self, msg_id: int) -> None:
         with self._tx() as c:
             c.execute("UPDATE messages SET handled = 1 WHERE id = ?", (msg_id,))
@@ -491,10 +563,23 @@ class Database:
             )
             return _new_id(cur), True
 
-    def has_mail_todos(self, msg_id: int) -> bool:
-        """这封邮件是否已经建过待办（含已完成的）。"""
-        return self._one("SELECT 1 AS x FROM todos WHERE message_id = ? AND source = 'email' LIMIT 1",
-                         (msg_id,)) is not None
+    def insert_mail_todos(self, msg_id: int, mailbox_id: str, thread: str, todos: list[dict[str, Any]]) -> list[int]:
+        """Commit every deadline together; a crash must not leave a partial set that blocks recovery."""
+        now = iso(utcnow())
+        created = []
+        with self._tx() as c:
+            if c.execute("SELECT 1 FROM todos WHERE message_id = ? AND source = 'email' LIMIT 1", (msg_id,)).fetchone():
+                return []
+            for t in todos:
+                cur = c.execute("""INSERT INTO todos(dedupe_key, mailbox_id, message_id, gm_thrid,
+                    title, kind, due_date, due_time, timezone, remind_at, source, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'email', ?, ?)
+                    ON CONFLICT(dedupe_key) DO NOTHING""",
+                    (t['dedupe_key'], mailbox_id, msg_id, thread, t['title'], t['kind'], t['due_date'],
+                     t['due_time'], t['timezone'], iso(t['remind_at']), now, now))
+                if cur.rowcount:
+                    created.append(_new_id(cur))
+        return created
 
     def get_todo(self, todo_id: int) -> dict[str, Any] | None:
         return self._one("SELECT * FROM todos WHERE id = ?", (todo_id,))
@@ -509,6 +594,19 @@ class Database:
     def due_todos(self, now: datetime) -> list[dict[str, Any]]:
         return self._all("SELECT * FROM todos WHERE status = 'open' AND remind_at IS NOT NULL AND remind_at <= ? ORDER BY remind_at",
                          (iso(now),))
+
+    def overdue_todos(self, today: str, limit: int = 5, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+        count = self._one("SELECT COUNT(*) n FROM todos WHERE status = 'open' AND due_date < ?", (today,))
+        rows = self._all("""SELECT * FROM todos WHERE status = 'open' AND due_date < ?
+            ORDER BY due_date DESC, id DESC LIMIT ? OFFSET ?""", (today, limit, offset))
+        return rows, count['n'] if count else 0
+
+    def digest_todos(self, today: str, through: str) -> list[dict[str, Any]]:
+        """Reserve space for imminent tasks; never let an old backlog consume the whole digest."""
+        upcoming = self._all("""SELECT * FROM todos WHERE status = 'open' AND due_date BETWEEN ? AND ?
+            ORDER BY due_date, due_time, id LIMIT 30""", (today, through))
+        overdue, _ = self.overdue_todos(today)
+        return upcoming + overdue
 
     def reschedule_todo(self, todo_id: int, remind_at: datetime | None, bump_count: bool = False) -> None:
         with self._tx() as c:
@@ -567,10 +665,74 @@ class Database:
         return self._all(
             "SELECT * FROM outbox WHERE status = 'queued' AND not_before <= ? ORDER BY id LIMIT ?", (iso(now), limit))
 
+    def enqueue_mail_notification(self, msg_id: int, mailbox_id: str, thread: str, channel: str, chat_id: str,
+                                  msg: OutMessage, not_before: datetime, urgent: bool) -> None:
+        """First alert now; group ordinary follow-ups for five minutes, at most ten per alert.
+
+        Never mutate a sending/retried payload: an earlier part may already have reached the owner.
+        Membership and payload changes commit together, so retries/restarts cannot append twice.
+        """
+        now = utcnow()
+        since = iso(now - timedelta(minutes=15))
+        groupable = bool(thread) and not urgent
+        with self._tx() as c:
+            if c.execute("SELECT 1 FROM notification_items WHERE message_id = ?", (msg_id,)).fetchone():
+                return
+            existing = c.execute("SELECT id FROM outbox WHERE dedupe_key = ?", (f"notify:{msg_id}",)).fetchone()
+            if existing:
+                return
+            group = None
+            recent = False
+            if groupable:
+                rows = c.execute("""SELECT o.*, COUNT(*) AS item_count, MIN(i.message_id) AS first_message
+                    FROM outbox o JOIN notification_items i ON i.outbox_id = o.id
+                    JOIN messages m ON m.id = i.message_id
+                    WHERE m.mailbox_id = ? AND m.gm_thrid = ? AND i.groupable = 1
+                    AND o.channel = ? AND o.chat_id = ? AND o.created_at >= ?
+                    AND o.status IN ('queued', 'sending', 'sent') GROUP BY o.id ORDER BY o.id DESC""",
+                    (mailbox_id, thread, channel, chat_id, since)).fetchall()
+                recent = bool(rows)
+                for row in rows:
+                    if (row['status'] == 'queued' and row['attempts'] == 0 and row['item_count'] < 10
+                            and (not_before <= now or row['not_before'] >= iso(not_before))):
+                        old = json.loads(row['payload'])
+                        size = len(old['text']) + len(msg.text) + len(msg.title or '') + len(old.get('title') or '')
+                        if size + 100 <= 12000:
+                            group = row
+                            break
+            if group is not None:
+                old = json.loads(group['payload'])
+                prefix = f"Mail #{group['first_message']}\n{old.get('title') or ''}\n" if group['item_count'] == 1 else ""
+                text = prefix + old['text'] + f"\n\n— Mail #{msg_id} —\n{msg.title or ''}\n{msg.text}"
+                merged = OutMessage(title=f"📬 {group['item_count'] + 1} conversation updates", text=text,
+                                    buttons=msg.buttons)
+                c.execute("UPDATE outbox SET payload = ? WHERE id = ?", (json.dumps(asdict(merged), ensure_ascii=False),
+                                                                       group['id']))
+                out_id = group['id']
+            else:
+                send_at = max(not_before, now + timedelta(minutes=5)) if recent else not_before
+                cur = c.execute("""INSERT INTO outbox(dedupe_key, channel, chat_id, payload, not_before, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""", (f"notify:{msg_id}", channel, chat_id,
+                    json.dumps(asdict(msg), ensure_ascii=False), iso(send_at), iso(now)))
+                out_id = _new_id(cur)
+            c.execute("INSERT INTO notification_items(message_id, outbox_id, groupable) VALUES (?, ?, ?)",
+                      (msg_id, out_id, int(groupable)))
+
+    def reset_outbox_claims(self) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE outbox SET status = 'queued', attempts = attempts + 1 WHERE status = 'sending'")
+
+    def claim_outbox(self, outbox_id: int) -> dict[str, Any] | None:
+        with self._tx() as c:
+            cur = c.execute("UPDATE outbox SET status = 'sending' WHERE id = ? AND status = 'queued'", (outbox_id,))
+            return dict(c.execute("SELECT * FROM outbox WHERE id = ?", (outbox_id,)).fetchone()) if cur.rowcount else None
+
     def outbox_sent(self, outbox_id: int, provider_message_id: str) -> None:
         with self._tx() as c:
             c.execute("UPDATE outbox SET status = 'sent', provider_message_id = ?, sent_at = ? WHERE id = ?",
                       (provider_message_id, iso(utcnow()), outbox_id))
+            c.execute("""UPDATE messages SET notified_at = ? WHERE id IN
+                (SELECT message_id FROM notification_items WHERE outbox_id = ?)""", (iso(utcnow()), outbox_id))
 
     def outbox_failed(self, outbox_id: int, error: str, retry_at: datetime | None) -> None:
         """retry_at=None（不可重试）标 failed；否则不限次数，到 retry_at 再试：
@@ -849,9 +1011,14 @@ class Database:
             "failed": one("SELECT COUNT(*) AS n FROM messages WHERE status = 'failed'"),
             "notified_24h": one(f"SELECT COUNT(*) AS n FROM messages WHERE notified_at >= '{iso(utcnow() - timedelta(hours=24))}'"),
             "open_todos": one("SELECT COUNT(*) AS n FROM todos WHERE status = 'open'"),
-            "outbox_queued": one("SELECT COUNT(*) AS n FROM outbox WHERE status = 'queued'"),
+            "outbox_queued": one("SELECT COUNT(*) AS n FROM outbox WHERE status IN ('queued', 'sending')"),
             "outbox_failed": one("SELECT COUNT(*) AS n FROM outbox WHERE status = 'failed'"),
-            "mailboxes": self._all("SELECT * FROM mailbox_state ORDER BY mailbox_id"),
+            "analysis_recovery_queued": self.recovery_counts()[0],
+            "analysis_recovery_failed": self.recovery_counts()[1],
+            "backup_last_success": self.kv_get("backup_last_success") or "never",
+            "backup_error": self.kv_get("backup_error") or "none",
+            "mailboxes": self._all("""SELECT s.*, (SELECT MAX(created_at) FROM messages m
+                WHERE m.mailbox_id = s.mailbox_id) AS last_message_at FROM mailbox_state s ORDER BY mailbox_id"""),
         }
 
 

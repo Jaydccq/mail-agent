@@ -15,10 +15,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from typing import Any
 
-from mailagent.ai.llm._util import extract_json, looks_like_auth_error, resolve_command, run_cli, short, strict_schema
+from mailagent.ai.llm._util import extract_json, looks_like_auth_error, resolve_command, run_cli, strict_schema
 from mailagent.ai.llm.base import LLMError
 from mailagent.config import LLMConfig
 
@@ -34,6 +35,23 @@ DISABLED_FEATURES = (
 )
 
 _SEP = "\n\n==========\n\n"
+
+
+def failure_detail(output: str) -> str:
+    """Classify the full diagnostic stream without logging echoed prompts, URLs or secrets."""
+    statuses = re.findall(r"\bHTTP(?:/\d(?:\.\d)?)?\s+(?:error[: ]*|status[: =]*)?([45]\d\d)\b", output, re.I)
+    if statuses:
+        return f"HTTP {statuses[-1]}"
+    lower = output.lower()
+    if looks_like_auth_error(lower):
+        return "authentication failed"
+    if "timed out" in lower or "timeout" in lower:
+        return "request timed out"
+    if "websocket" in lower:
+        return "WebSocket transport failed"
+    if "connection" in lower or "connect" in lower:
+        return "connection failed"
+    return "CLI exited without a usable response"
 
 
 class CodexCLI:
@@ -73,9 +91,9 @@ class CodexCLI:
                     result = ""
 
         if code != 0 or not result:
-            detail = short(err or out)
+            detail = failure_detail(err or out)
             log.warning("codex-cli failed code=%s: %s", code, detail)
-            if looks_like_auth_error(detail) or "401" in detail:
+            if detail == "authentication failed" or detail in ("HTTP 401", "HTTP 403"):
                 raise LLMError(f"codex CLI is not logged in or authentication failed: {detail}. "
                                "Run `codex login`.", retryable=False)
             raise LLMError(f"codex CLI failed (exit code {code}): {detail or 'no output'}", retryable=True)

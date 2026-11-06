@@ -1,5 +1,7 @@
 # Testing
 
+Operational regression coverage and the local Java/GreenMail setup are documented in [Reliability and recovery](reliability.md#verification).
+
 ```bash
 uv pip install -e '.[dev]'
 pytest                                   # offline unit tests + fake Telegram

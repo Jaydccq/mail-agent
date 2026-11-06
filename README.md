@@ -107,6 +107,8 @@ Everything else, including all commands and where data lives: [docs/usage.md](do
 - [Setup guide](docs/setup.md): each prerequisite step by step, the wizard, upgrading, uninstalling, troubleshooting
 - [Everyday use](docs/usage.md): alerts, digests, todos, chat, replies, memory, every command, data and config
 - [Testing](docs/testing.md): running the tests, the live chat eval, and what has been tested for real
+- [Operational review, 2026-11-06](docs/operations-review-2026-11-06.md): runtime evidence and prioritized improvements
+- [Reliability and recovery](docs/reliability.md): analysis retries, conversation alerts, overdue review and verified backups
 - [Contracts](CONTRACTS.md): module interfaces, for contributors
 
 ## License

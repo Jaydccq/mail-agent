@@ -8,17 +8,19 @@ import json
 import logging
 import time as _time
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Callable, TypeVar
 
 from mailagent.agent import render
 from mailagent.agent.pipeline import is_paused, primary_target
 from mailagent.agent.suggest import Suggester
 from mailagent.agent.timeutil import (
-    fmt_local, in_quiet, latest_slot, next_reminder, parse_date, parse_iso_safe, quiet_deferral, reminder_times,
+    fmt_local, in_quiet, latest_slot, next_reminder, parse_iso_safe, quiet_deferral, reminder_times,
     shift_due, to_local, today_local, utcnow,
 )
 from mailagent.ai import analyze
 from mailagent.ai.llm.base import LLM
+from mailagent.backup import create_backup
 from mailagent.config import Config, MailboxConfig
 from mailagent.db import Database
 from mailagent.mail.imap import ImapMailbox
@@ -82,6 +84,7 @@ class Scheduler:
         self.suggester = Suggester(cfg, db)
         self._last_sent_poll = 0.0
         self._last_prune: float | None = None  # 启动后第一轮就清理一次
+        self._last_backup_try: float | None = None
 
     async def run(self) -> None:
         while True:
@@ -94,6 +97,7 @@ class Scheduler:
             await asyncio.sleep(TICK_SECONDS)
 
     async def tick(self) -> None:
+        await self.backup_if_due()
         self.send_reminders()
         await self.scheduled_digest()
         self.send_queued_suggestion()
@@ -105,6 +109,26 @@ class Scheduler:
             removed = self.db.prune(utcnow())
             if any(removed.values()):
                 log.info("Removed old records: %s", removed)
+
+    async def backup_if_due(self) -> None:
+        if self.db.path == ":memory:":
+            return
+        now = utcnow()
+        last = parse_iso_safe(self.db.kv_get("backup_last_success"))
+        if last is not None and now - last < timedelta(days=1):
+            return
+        if self._last_backup_try is not None and _time.monotonic() - self._last_backup_try < 3600:
+            return
+        self._last_backup_try = _time.monotonic()
+        try:
+            path = await asyncio.to_thread(create_backup, Path(self.db.path))
+        except Exception as e:
+            self.db.kv_set("backup_error", type(e).__name__)
+            log.exception("Database backup failed; will retry in one hour")
+        else:
+            self.db.kv_set("backup_last_success", now.isoformat())
+            self.db.kv_set("backup_error", "")
+            log.info("Verified database backup: %s", path.name)
 
     # ---- 待办提醒 ----
 
@@ -179,14 +203,9 @@ class Scheduler:
     # ---- 摘要 ----
 
     def _digest_todos(self) -> list[dict[str, Any]]:
-        """未来 3 天内到期（含已过期）的未完成待办。"""
-        limit = today_local(utcnow(), self.cfg.prefs.timezone) + timedelta(days=3)
-        out = []
-        for t in self.db.open_todos(limit=100):
-            d = parse_date(t.get("due_date"))
-            if d is not None and d <= limit:
-                out.append(t)
-        return out
+        """未来三天优先，另列最近五条过期项；更早的由 /overdue 复核。"""
+        today = today_local(utcnow(), self.cfg.prefs.timezone)
+        return self.db.digest_todos(today.isoformat(), (today + timedelta(days=3)).isoformat())
 
     async def compose_digest(self, slot_label: str, *, manual: bool) -> tuple[OutMessage | None, list[int]]:
         """生成摘要。没内容且没邮箱异常时：定时摘要返回 None（不发），手动摘要返回一条"没有新内容"。"""
@@ -206,6 +225,9 @@ class Scheduler:
             body = "No new mail in the mailboxes that are syncing fine."
         if problems:
             body += "\n\n(Mailboxes that failed to sync may have mail I haven't fetched yet; I'll catch up once they're fixed.)"
+        _, overdue_count = self.db.overdue_todos(today_local(utcnow(), prefs.timezone).isoformat(), limit=0)
+        if overdue_count:
+            body += f"\n\n{overdue_count} overdue task(s) remain open. Use /overdue to review, complete or dismiss them."
         return render.digest(body, slot_label=slot_label, problems=problems, paused=paused), [m["id"] for m in mails]
 
     async def scheduled_digest(self) -> None:

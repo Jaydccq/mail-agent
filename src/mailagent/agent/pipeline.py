@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time as _time
+from datetime import timedelta
 from typing import Any
 
 from mailagent.agent import render
@@ -19,7 +20,7 @@ from mailagent.ai.jev import JevClient, fallback_triage
 from mailagent.ai.llm.base import LLM
 from mailagent.config import Config
 from mailagent.db import Database
-from mailagent.models import Analysis, MailMessage, Triage
+from mailagent.models import Analysis, MailMessage, OutMessage, Triage
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ MAX_ATTEMPTS = 5
 # 重试会推迟通知（按下面 process() 的退避，约 1 分钟、2 分钟），所以只重试这几次，之后宁可用模板也按时通知。
 # 必须小于 MAX_ATTEMPTS：失败次数用完的邮件会被标 failed，再也不处理。
 LLM_RETRIES = 2
+RECOVERY_ATTEMPTS = 5
 
 
 def primary_target(cfg: Config) -> tuple[str, str] | None:
@@ -90,6 +92,77 @@ class Pipeline:
         self.llm = llm
         self.wake = asyncio.Event()
         self._next_try: dict[int, float] = {}  # msg_id -> monotonic 时刻（失败退避，只在内存里）
+
+    async def recovery_worker(self) -> None:
+        while True:
+            await self.recover_analysis()
+            await asyncio.sleep(1 if self.db.due_analysis_recovery(utcnow()) else 60)
+
+    async def recover_analysis(self) -> None:
+        """One bounded background recovery; never re-triage or replay an old notification."""
+        if self.llm is None:
+            return
+        db, cfg, now = self.db, self.cfg, utcnow()
+        db.seed_analysis_recovery([m.id for m in cfg.mailboxes], now)
+        self._analysis_health()
+        job = db.due_analysis_recovery(now)
+        if job is None:
+            return
+        msg_id = job["message_id"]
+        row = db.get_message(msg_id)
+        if (row is None or row["handled"] or row["analysis_source"] != "template"
+                or not any(m.id == job["mailbox_id"] for m in cfg.mailboxes)):
+            db.complete_analysis_recovery(msg_id)
+        elif row["created_at"] < (now - timedelta(days=7)).isoformat():
+            db.analysis_recovery_failed(msg_id, "Recovery window expired", None)
+        else:
+            mail = db.message_from_row(row)
+            try:
+                result = await analyze.analyze_mail(
+                    self.llm, mail, now_local=to_local(now, cfg.prefs.timezone), tz=cfg.prefs.timezone,
+                    language=cfg.prefs.language, memories=[m["text"] for m in db.list_memories()],
+                    thread=thread_context(db, mail, msg_id), raise_retryable=True)
+                if result.source != "llm":
+                    raise ValueError("Model output could not be used")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                attempt = job["attempts"] + 1
+                retry_at = now + timedelta(seconds=min(900 * 2 ** attempt, 14400))
+                db.analysis_recovery_failed(msg_id, type(e).__name__,
+                                            retry_at if attempt < RECOVERY_ATTEMPTS else None)
+                log.warning("Analysis recovery #%s failed (%s), attempt %s/%s",
+                            msg_id, type(e).__name__, attempt, RECOVERY_ATTEMPTS)
+            else:
+                self._save_todos(msg_id, mail, result)
+                db.complete_analysis_recovery(msg_id, result)
+                log.info("Recovered analysis #%s without replaying its notification", msg_id)
+        self._analysis_health()
+
+    def _analysis_health(self) -> None:
+        queued, failed = self.db.recovery_counts()
+        episode = self.db.kv_get("analysis_outage")
+        target = primary_target(self.cfg)
+        if target is None:
+            return
+        if queued + failed and not episode:
+            episode = utcnow().isoformat()
+            text = ("Some emails have template-only analyses awaiting recovery. Mail delivery continues, but dates may "
+                    "not become reminders until analysis recovers. Recovery retries are saved across restarts; "
+                    "each message gets at most five attempts within seven days. /status shows the queue.")
+            state = "degraded"
+        elif not queued + failed and episode:
+            text = ("The analysis recovery queue is clear. Recovered analyses can add future reminders; "
+                    "old mail notifications were not replayed. Review /todo for any new tasks.")
+            state = "recovered"
+        else:
+            return
+        prefs = self.cfg.prefs
+        title = "Analysis recovery: pending" if state == "degraded" else "Analysis recovery: complete"
+        self.db.enqueue(*target, OutMessage(title=title, text=text),
+                        dedupe_key=f"analysis:{state}:{episode}",
+                        not_before=quiet_deferral(utcnow(), prefs.quiet_start, prefs.quiet_end, prefs.timezone))
+        self.db.kv_set("analysis_outage", episode if state == "degraded" else "")
 
     async def run(self) -> None:
         """常驻：先处理上次没处理完的，然后等 wake（新邮件入库）或定时重查。"""
@@ -175,18 +248,18 @@ class Pipeline:
                     quiet_deferral(now, prefs.quiet_start, prefs.quiet_end, prefs.timezone)
                 out = render.notification(msg_id, mail, analysis, tz=prefs.timezone,
                                           show_draft=show_draft_button(analysis, triage, self.llm))
-                db.enqueue(target[0], target[1], out, dedupe_key=f"notify:{msg_id}", not_before=not_before)
+                db.enqueue_mail_notification(msg_id, mail.mailbox_id, mail.gm_thrid, *target, out, not_before,
+                                             urgent="vip" in rule_kinds or triage.category == "security")
 
         # 6. 完成
         db.finish_message(msg_id, decision, reason, analysis)
         log.info("Email #%s → %s (%s, triage=%s)", msg_id, decision, reason, triage.source)
 
     def _save_todos(self, msg_id: int, mail: MailMessage, analysis: Analysis) -> None:
-        if self.db.has_mail_todos(msg_id):
-            return  # 重试（上次存完待办、标记完成前失败了）：这次模型的措辞可能不同，不能再建一份
         prefs = self.cfg.prefs
         now = utcnow()
         today = today_local(now, prefs.timezone)
+        todos = []
         for d in analysis.deadlines:
             due = parse_date(d.date)
             if due is None or due < today:  # 已经过去的日期不建待办
@@ -195,10 +268,8 @@ class Pipeline:
             # 模型已把 date/time 换算成用户本地时区（d.timezone 只说明邮件原文用的时区），所以按本地时区存
             tzname = prefs.timezone
             remind = next_reminder({"due_date": d.date, "due_time": due_time, "timezone": tzname}, now, prefs.timezone)
-            todo_id, created = self.db.upsert_todo(
-                dedupe_key=f"mail:{msg_id}:{d.date}:{due_time or ''}:{d.what}", title=d.what, kind=d.kind or "deadline",
-                due_date=d.date, due_time=due_time, timezone_name=tzname, remind_at=remind,
-                mailbox_id=mail.mailbox_id, message_id=msg_id, gm_thrid=mail.gm_thrid, source="email",
-            )
-            if created:
-                log.info("Email #%s → new todo #%s (%s %s)", msg_id, todo_id, d.date, due_time or "")
+            todos.append(dict(dedupe_key=f"mail:{msg_id}:{d.date}:{due_time or ''}:{d.what}", title=d.what,
+                              kind=d.kind or "deadline", due_date=d.date, due_time=due_time,
+                              timezone=tzname, remind_at=remind))
+        for todo_id in self.db.insert_mail_todos(msg_id, mail.mailbox_id, mail.gm_thrid, todos):
+            log.info("Email #%s → new todo #%s", msg_id, todo_id)
